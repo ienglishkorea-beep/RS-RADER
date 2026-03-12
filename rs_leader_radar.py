@@ -296,52 +296,51 @@ def notify_bucket(results: List[RSLeaderResult], bucket: str) -> None:
     send_telegram_chunked(lines)
 
 
-def save_outputs(results: List[RSLeaderResult]) -> None:
+def send_summary(stats: Dict[str, Any]) -> None:
+    if not telegram_enabled():
+        return
+
+    msg = (
+        "[RS-RADAR 요약]\n"
+        f"실행 시각: {stats['run_at']}\n"
+        f"유니버스 수: {stats['universe_count']}\n"
+        f"데이터 정상 수집: {stats['download_ok']}\n"
+        f"데이터 부족/실패: {stats['download_fail_or_short']}\n"
+        f"가격/거래대금 탈락: {stats['liquidity_fail']}\n"
+        f"이평 정렬 탈락: {stats['ma_fail']}\n"
+        f"3개월 수익률 20% 미만 탈락: {stats['ret3m_fail']}\n"
+        f"RS 95 미만 탈락: {stats['rs_fail']}\n"
+        f"차단 섹터 탈락: {stats['sector_block_fail']}\n"
+        f"거리 조건 탈락: {stats['distance_fail']}\n"
+        f"RS 리더 최종 후보: {stats['final_total']}\n"
+        f"돌파 준비(-5% 이내): {stats['ready_count']}\n"
+        f"Watchlist(-20%~-5%): {stats['watch_count']}\n"
+        f"RS S: {stats['rs_s']}\n"
+        f"RS A: {stats['rs_a']}"
+    )
+    send_telegram(msg)
+
+
+def save_outputs(results: List[RSLeaderResult], stats: Dict[str, Any]) -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     cols = [f.name for f in RSLeaderResult.__dataclass_fields__.values()]
 
     if not results:
         pd.DataFrame(columns=cols).to_csv(RESULT_FILE, index=False, encoding="utf-8-sig")
-        with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "run_at": datetime.now().isoformat(),
-                    "total": 0,
-                    "ready_count": 0,
-                    "watch_count": 0,
-                    "rs_s": 0,
-                    "rs_a": 0,
-                    "as_of_date": None,
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-        return
+    else:
+        df = pd.DataFrame([asdict(r) for r in results])
+        df["bucket_rank"] = df["bucket"].map({"ready": 0, "watch": 1}).fillna(9)
+        df["rs_rank"] = df["rs_grade"].map({"S": 0, "A": 1}).fillna(9)
 
-    df = pd.DataFrame([asdict(r) for r in results])
-    df["bucket_rank"] = df["bucket"].map({"ready": 0, "watch": 1}).fillna(9)
-    df["rs_rank"] = df["rs_grade"].map({"S": 0, "A": 1}).fillna(9)
+        df = df.sort_values(
+            ["bucket_rank", "rs_rank", "rs_percentile", "distance_to_52w_high", "ticker"],
+            ascending=[True, True, False, False, True],
+        ).drop(columns=["bucket_rank", "rs_rank"])
 
-    df = df.sort_values(
-        ["bucket_rank", "rs_rank", "rs_percentile", "distance_to_52w_high", "ticker"],
-        ascending=[True, True, False, False, True],
-    ).drop(columns=["bucket_rank", "rs_rank"])
-
-    df.to_csv(RESULT_FILE, index=False, encoding="utf-8-sig")
-
-    summary = {
-        "run_at": datetime.now().isoformat(),
-        "total": int(len(df)),
-        "ready_count": int((df["bucket"] == "ready").sum()),
-        "watch_count": int((df["bucket"] == "watch").sum()),
-        "rs_s": int((df["rs_grade"] == "S").sum()),
-        "rs_a": int((df["rs_grade"] == "A").sum()),
-        "as_of_date": str(df["as_of_date"].max()),
-    }
+        df.to_csv(RESULT_FILE, index=False, encoding="utf-8-sig")
 
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+        json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
 def scan_one(
@@ -349,19 +348,19 @@ def scan_one(
     name: str,
     spy_df: pd.DataFrame,
     sector_cache: Dict[str, Dict[str, str]],
-) -> Optional[RSLeaderResult]:
+) -> Tuple[Optional[RSLeaderResult], str]:
     df = download_history(ticker)
     if df.empty or len(df) < MIN_HISTORY:
-        return None
+        return None, "download_fail_or_short"
 
     close = float(df["Close"].iloc[-1])
     if close < MIN_PRICE:
-        return None
+        return None, "liquidity_fail"
 
     df["dollar_vol_20"] = (df["Close"] * df["Volume"]).rolling(20).mean()
     dollar_vol_20 = safe_float(df["dollar_vol_20"].iloc[-1])
     if dollar_vol_20 is None or dollar_vol_20 < MIN_DOLLAR_VOL_20:
-        return None
+        return None, "liquidity_fail"
 
     df["ma50"] = df["Close"].rolling(50).mean()
     df["ma150"] = df["Close"].rolling(150).mean()
@@ -372,14 +371,14 @@ def scan_one(
     ma200 = safe_float(df["ma200"].iloc[-1])
 
     if ma50 is None or ma150 is None or ma200 is None:
-        return None
+        return None, "download_fail_or_short"
 
     if REQUIRE_MA_ALIGNMENT and not (close > ma50 > ma150 > ma200):
-        return None
+        return None, "ma_fail"
 
     ret_3m = safe_float(rolling_return(df["Close"], 63).iloc[-1])
     if ret_3m is None or ret_3m < MIN_3M_RETURN:
-        return None
+        return None, "ret3m_fail"
 
     stock = df.copy().set_index("Date")
     spy = spy_df.copy().set_index("Date")
@@ -387,24 +386,24 @@ def scan_one(
 
     rs_line = stock["Close"] / spy_close
     if len(rs_line) < RS_LOOKBACK:
-        return None
+        return None, "download_fail_or_short"
 
     rs_high = float(rs_line.tail(RS_LOOKBACK).max())
     rs_low = float(rs_line.tail(RS_LOOKBACK).min())
     rs_now = float(rs_line.iloc[-1])
 
     if rs_high <= 0 or rs_high <= rs_low:
-        return None
+        return None, "download_fail_or_short"
 
     rs_current_vs_high = rs_now / rs_high
     rs_percentile = ((rs_now - rs_low) / (rs_high - rs_low)) * 100.0
 
     if rs_percentile < RS_PERCENTILE_MIN:
-        return None
+        return None, "rs_fail"
 
     high_52w = float(df["High"].rolling(252).max().iloc[-1])
     if high_52w <= 0:
-        return None
+        return None, "download_fail_or_short"
 
     distance_to_52w_high = close / high_52w - 1.0
 
@@ -413,15 +412,15 @@ def scan_one(
     elif WATCH_MIN_DISTANCE <= distance_to_52w_high < WATCH_MAX_DISTANCE:
         bucket = "watch"
     else:
-        return None
+        return None, "distance_fail"
 
     sector, industry = get_sector_info(ticker, sector_cache)
     if is_blocked_sector(sector, industry):
-        return None
+        return None, "sector_block_fail"
 
     rs_grade = get_rs_grade(rs_current_vs_high)
 
-    return RSLeaderResult(
+    result = RSLeaderResult(
         bucket=bucket,
         ticker=ticker,
         name=name,
@@ -440,6 +439,7 @@ def scan_one(
         ma150=round(float(ma150), 2),
         ma200=round(float(ma200), 2),
     )
+    return result, "ok"
 
 
 def main() -> None:
@@ -453,16 +453,38 @@ def main() -> None:
     sector_cache = load_sector_cache()
     results: List[RSLeaderResult] = []
 
+    stats: Dict[str, Any] = {
+        "run_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "universe_count": int(len(universe)),
+        "download_ok": 0,
+        "download_fail_or_short": 0,
+        "liquidity_fail": 0,
+        "ma_fail": 0,
+        "ret3m_fail": 0,
+        "rs_fail": 0,
+        "sector_block_fail": 0,
+        "distance_fail": 0,
+        "final_total": 0,
+        "ready_count": 0,
+        "watch_count": 0,
+        "rs_s": 0,
+        "rs_a": 0,
+        "as_of_date": None,
+    }
+
     for row in universe.itertuples(index=False):
         try:
-            result = scan_one(row.ticker, row.name, spy, sector_cache)
-            if result is not None:
+            result, status = scan_one(row.ticker, row.name, spy, sector_cache)
+            if status == "ok" and result is not None:
+                stats["download_ok"] += 1
                 results.append(result)
+            else:
+                stats[status] += 1
         except Exception:
+            stats["download_fail_or_short"] += 1
             continue
 
     save_sector_cache(sector_cache)
-    save_outputs(results)
 
     ready_results = [r for r in results if r.bucket == "ready"]
     watch_results = [r for r in results if r.bucket == "watch"]
@@ -486,8 +508,17 @@ def main() -> None:
         ),
     )
 
+    stats["final_total"] = len(results)
+    stats["ready_count"] = len(ready_results)
+    stats["watch_count"] = len(watch_results)
+    stats["rs_s"] = sum(1 for r in results if r.rs_grade == "S")
+    stats["rs_a"] = sum(1 for r in results if r.rs_grade == "A")
+    stats["as_of_date"] = results[0].as_of_date if results else None
+
+    save_outputs(results, stats)
     notify_bucket(ready_results, "ready")
     notify_bucket(watch_results, "watch")
+    send_summary(stats)
 
 
 if __name__ == "__main__":
