@@ -1,5 +1,6 @@
 import os
 import json
+import runpy
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,40 +31,20 @@ RS_LOOKBACK = 252
 RS_PERCENTILE_MIN = 95.0
 RS_NEW_HIGH_TOL = 0.995
 
-READY_MAX_DISTANCE = -0.05      # 52주 고점 -5% 이내
-WATCH_MIN_DISTANCE = -0.20      # -20% 이상
-WATCH_MAX_DISTANCE = -0.05      # -5% 미만
+READY_MAX_DISTANCE = -0.05     # 52주 고점 -5% 이내
+WATCH_MIN_DISTANCE = -0.20     # -20% 이상
+WATCH_MAX_DISTANCE = -0.05     # -5% 미만
 
 REQUIRE_MA_ALIGNMENT = True
 
 BLOCKED_KEYWORDS = [
-    "energy",
-    "oil",
-    "gas",
-    "midstream",
-    "upstream",
-    "downstream",
-    "utilities",
-    "utility",
+    "energy", "oil", "gas", "midstream", "upstream", "downstream",
+    "utilities", "utility",
     "insurance",
-    "food",
-    "beverage",
-    "tobacco",
-    "biotech",
-    "biotechnology",
-    "drug manufacturers",
-    "pharmaceutical",
-    "pharma",
-    "metals",
-    "mining",
-    "coal",
-    "materials",
-    "basic materials",
-    "steel",
-    "aluminum",
-    "precious metals",
-    "gold",
-    "silver",
+    "food", "beverage", "tobacco",
+    "biotech", "biotechnology", "drug manufacturers", "pharmaceutical", "pharma",
+    "metals", "mining", "coal", "materials", "basic materials", "steel", "aluminum",
+    "precious metals", "gold", "silver",
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -122,6 +103,7 @@ def telegram_enabled() -> bool:
 def send_telegram(text: str) -> None:
     if not telegram_enabled():
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(
         url,
@@ -157,7 +139,15 @@ def send_telegram_chunked(lines: List[str]) -> None:
         send_telegram(chunk)
 
 
+def ensure_universe_file() -> None:
+    if os.path.exists(UNIVERSE_FILE):
+        return
+    runpy.run_path(os.path.join(BASE_DIR, "build_universe.py"), run_name="__main__")
+
+
 def load_universe() -> pd.DataFrame:
+    ensure_universe_file()
+
     if not os.path.exists(UNIVERSE_FILE):
         raise FileNotFoundError(f"유니버스 파일 없음: {UNIVERSE_FILE}")
 
@@ -184,6 +174,7 @@ def normalize_downloaded(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.reset_index()
     rename_map = {}
+
     for c in df.columns:
         cl = str(c).lower()
         if cl == "date":
@@ -265,7 +256,7 @@ def is_blocked_sector(sector: str, industry: str) -> bool:
     return any(keyword in text for keyword in BLOCKED_KEYWORDS)
 
 
-def get_rs_grade(rs_percentile: float, rs_current_vs_high: float) -> str:
+def get_rs_grade(rs_current_vs_high: float) -> str:
     if rs_current_vs_high >= RS_NEW_HIGH_TOL:
         return "S"
     return "A"
@@ -287,7 +278,7 @@ def build_result_lines(r: RSLeaderResult) -> List[str]:
 
 
 def notify_bucket(results: List[RSLeaderResult], bucket: str) -> None:
-    if not telegram_enabled() or not results:
+    if not telegram_enabled():
         return
 
     if bucket == "ready":
@@ -383,9 +374,8 @@ def scan_one(
     if ma50 is None or ma150 is None or ma200 is None:
         return None
 
-    if REQUIRE_MA_ALIGNMENT:
-        if not (close > ma50 > ma150 > ma200):
-            return None
+    if REQUIRE_MA_ALIGNMENT and not (close > ma50 > ma150 > ma200):
+        return None
 
     ret_3m = safe_float(rolling_return(df["Close"], 63).iloc[-1])
     if ret_3m is None or ret_3m < MIN_3M_RETURN:
@@ -429,7 +419,7 @@ def scan_one(
     if is_blocked_sector(sector, industry):
         return None
 
-    rs_grade = get_rs_grade(rs_percentile, rs_current_vs_high)
+    rs_grade = get_rs_grade(rs_current_vs_high)
 
     return RSLeaderResult(
         bucket=bucket,
