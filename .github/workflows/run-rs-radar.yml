@@ -1,31 +1,32 @@
-name: Run RS Radar
+name: run-rs-radar
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 22 * * 1-5'
+    - cron: "10 22 * * 1-5"
 
 jobs:
   run-rs-radar:
     runs-on: ubuntu-latest
 
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests
+          pip install pandas yfinance requests lxml html5lib beautifulsoup4
 
       - name: Run RS Radar
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python run_scanners.py
